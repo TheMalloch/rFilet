@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>filet - send file</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  background: #0a0a0a; color: #e0e0e0;
+  min-height: 100vh; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; padding: 2rem;
+}
+h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #fff; }
+.subtitle { color: #666; margin-bottom: 2rem; font-size: 0.85rem; }
+#drop-zone {
+  width: 100%; max-width: 500px; border: 2px dashed #333;
+  border-radius: 12px; padding: 3rem 2rem; text-align: center;
+  cursor: pointer; transition: all 0.2s;
+}
+#drop-zone:hover, #drop-zone.dragover { border-color: #4a9eff; background: #111; }
+#drop-zone p { color: #888; margin-bottom: 0.5rem; }
+#file-input { display: none; }
+.file-info { margin-top: 1rem; color: #4a9eff; font-size: 0.9rem; }
+#status-area { max-width: 500px; width: 100%; margin-top: 1.5rem; }
+.link-box {
+  background: #111; border: 1px solid #333; border-radius: 8px;
+  padding: 1rem; display: flex; align-items: center; gap: 0.5rem;
+  margin-top: 1rem;
+}
+.link-box input {
+  flex: 1; background: none; border: none; color: #4a9eff;
+  font-family: inherit; font-size: 0.85rem; outline: none;
+}
+.link-box button, .btn {
+  background: #4a9eff; color: #000; border: none; border-radius: 6px;
+  padding: 0.5rem 1rem; font-family: inherit; cursor: pointer;
+  font-weight: 600; font-size: 0.85rem;
+}
+.btn:hover, .link-box button:hover { background: #6ab4ff; }
+.progress-container {
+  margin-top: 1rem; background: #111; border-radius: 8px;
+  padding: 1rem; border: 1px solid #333;
+}
+.progress-bar-outer {
+  width: 100%; height: 8px; background: #222; border-radius: 4px;
+  overflow: hidden; margin: 0.5rem 0;
+}
+.progress-bar-inner {
+  height: 100%; background: #4a9eff; width: 0%;
+  transition: width 0.2s; border-radius: 4px;
+}
+.progress-stats { display: flex; justify-content: space-between; font-size: 0.8rem; color: #888; }
+.status-msg { color: #888; font-size: 0.85rem; margin-top: 0.5rem; }
+.status-msg.error { color: #ff4a4a; }
+.status-msg.success { color: #4aff4a; }
+.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>filet</h1>
+<p class="subtitle">encrypted file transfer &middot; no storage &middot; direct relay</p>
+
+<div id="drop-zone">
+  <p>drop a file here or click to select</p>
+  <p style="font-size: 0.75rem; color: #555;">files are end-to-end encrypted</p>
+  <input type="file" id="file-input">
+  <div class="file-info hidden" id="file-info"></div>
+</div>
+
+<div id="status-area">
+  <div id="waiting-section" class="hidden">
+    <div class="status-msg">waiting for recipient... <span id="wait-timer">0:00</span></div>
+    <div style="font-size:0.7rem; color:#555; margin-top:0.25rem;">link stays active as long as this tab is open</div>
+    <button class="btn" style="margin-top:0.75rem; background:#333; color:#aaa; font-size:0.8rem; padding:0.4rem 1rem;" onclick="cancelWait()">cancel</button>
+  </div>
+
+  <div id="link-section" class="hidden">
+    <div class="link-box">
+      <input type="text" id="share-link" readonly>
+      <button onclick="copyLink()">copy</button>
+    </div>
+  </div>
+
+  <div id="progress-section" class="hidden">
+    <div class="progress-container">
+      <div>sending...</div>
+      <div class="progress-bar-outer"><div class="progress-bar-inner" id="progress-bar"></div></div>
+      <div class="progress-stats">
+        <span id="progress-pct">0%</span>
+        <span id="progress-speed"></span>
+        <span id="progress-bytes">0 / 0</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="done-msg" class="status-msg success hidden"></div>
+  <div id="error-msg" class="status-msg error hidden"></div>
+</div>
+
+<script>
+const CHUNK_SIZE = 1 * 1024 * 1024;
+const MAX_BUFFERED = 8 * 1024 * 1024;
+const PIPELINE_DEPTH = 8;
+let ws = null;
+let selectedFile = null;
+let encKey = null;
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const fileInfo = document.getElementById('file-info');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
+  return (bytes/1024/1024/1024).toFixed(2) + ' GB';
+}
+
+async function handleFile(file) {
+  selectedFile = file;
+  fileInfo.textContent = `${file.name} (${formatSize(file.size)})`;
+  fileInfo.classList.remove('hidden');
+  dropZone.style.pointerEvents = 'none';
+  dropZone.style.opacity = '0.6';
+
+  // Generate encryption key
+  encKey = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
+  );
+
+  startSender();
+}
+
+async function startSender() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/send`);
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      filename: selectedFile.name,
+      size: selectedFile.size,
+      mime_type: selectedFile.type || 'application/octet-stream',
+    }));
+  };
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'ready') {
+      // Export key and put in URL fragment
+      const rawKey = await crypto.subtle.exportKey('raw', encKey);
+      const keyB64 = btoa(String.fromCharCode(...new Uint8Array(rawKey)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const link = `${location.origin}/d/${msg.id}#${keyB64}`;
+      document.getElementById('share-link').value = link;
+      document.getElementById('link-section').classList.remove('hidden');
+      document.getElementById('waiting-section').classList.remove('hidden');
+      startWaitTimer();
+    } else if (msg.type === 'start') {
+      stopWaitTimer();
+      document.getElementById('waiting-section').classList.add('hidden');
+      document.getElementById('progress-section').classList.remove('hidden');
+      sendFile();
+    } else if (msg.type === 'cancelled') {
+      showError('Recipient disconnected');
+    } else if (msg.type === 'error') {
+      showError(msg.error);
+    }
+  };
+
+  ws.onclose = () => {
+    if (!document.getElementById('done-msg').textContent) {
+      showError('Connection lost');
+    }
+  };
+
+  ws.onerror = () => showError('WebSocket error');
+}
+
+// MessageChannel-based yield that isn't throttled in background tabs
+function yieldMicro() {
+  return new Promise(r => {
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => r();
+    ch.port2.postMessage(null);
+  });
+}
+
+async function sendFile() {
+  const file = selectedFile;
+  const startTime = Date.now();
+  let sentBytes = 0;
+
+  // Producer: encrypt chunks ahead into a queue
+  const encryptedQueue = [];
+  let encryptDone = false;
+  let queueResolve = null;
+  let consumerResolve = null;
+
+  async function producer() {
+    let offset = 0;
+    while (offset < file.size) {
+      // Backpressure: limit queue depth
+      while (encryptedQueue.length >= PIPELINE_DEPTH) {
+        await new Promise(r => { queueResolve = r; });
+      }
+      const end = Math.min(offset + CHUNK_SIZE, file.size);
+      const blob = file.slice(offset, end);
+      const chunk = new Uint8Array(await blob.arrayBuffer());
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encrypted = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv }, encKey, chunk
+      );
+      const payload = new Uint8Array(12 + encrypted.byteLength);
+      payload.set(iv);
+      payload.set(new Uint8Array(encrypted), 12);
+      encryptedQueue.push({ payload, plainSize: chunk.length });
+      // Wake consumer if it was waiting for data
+      if (consumerResolve) { const r = consumerResolve; consumerResolve = null; r(); }
+      offset = end;
+    }
+    encryptDone = true;
+    // Wake consumer one last time so it sees encryptDone
+    if (consumerResolve) { const r = consumerResolve; consumerResolve = null; r(); }
+  }
+
+  // Consumer: drain queue into WebSocket
+  async function consumer() {
+    while (!encryptDone || encryptedQueue.length > 0) {
+      if (encryptedQueue.length === 0) {
+        // Wait for producer to signal new data (not throttled by browser)
+        await new Promise(r => { consumerResolve = r; });
+        continue;
+      }
+      const { payload, plainSize } = encryptedQueue.shift();
+      // Wake producer if it was waiting on queue depth
+      if (queueResolve) { const r = queueResolve; queueResolve = null; r(); }
+      // Backpressure: wait if WS buffer is full
+      while (ws.bufferedAmount > MAX_BUFFERED) {
+        await yieldMicro();
+      }
+      ws.send(payload);
+      sentBytes += plainSize;
+      updateProgress(sentBytes, file.size, startTime);
+    }
+  }
+
+  await Promise.all([producer(), consumer()]);
+
+  ws.send(JSON.stringify({ type: 'done' }));
+  document.getElementById('progress-section').classList.add('hidden');
+  const doneMsg = document.getElementById('done-msg');
+  doneMsg.textContent = `sent ${file.name} (${formatSize(file.size)})`;
+  doneMsg.classList.remove('hidden');
+}
+
+function updateProgress(offset, total, startTime) {
+  const pct = Math.min(100, (offset / total) * 100);
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('progress-pct').textContent = pct.toFixed(1) + '%';
+  document.getElementById('progress-bytes').textContent = `${formatSize(offset)} / ${formatSize(total)}`;
+  const elapsed = (Date.now() - startTime) / 1000;
+  if (elapsed > 0.5) {
+    document.getElementById('progress-speed').textContent = formatSize(offset / elapsed) + '/s';
+  }
+}
+
+function copyLink() {
+  const input = document.getElementById('share-link');
+  navigator.clipboard.writeText(input.value);
+}
+
+let waitInterval = null;
+let waitStart = 0;
+
+function startWaitTimer() {
+  waitStart = Date.now();
+  waitInterval = setInterval(() => {
+    const secs = Math.floor((Date.now() - waitStart) / 1000);
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    document.getElementById('wait-timer').textContent = `${m}:${s.toString().padStart(2,'0')}`;
+  }, 1000);
+}
+
+function stopWaitTimer() {
+  if (waitInterval) { clearInterval(waitInterval); waitInterval = null; }
+}
+
+function cancelWait() {
+  stopWaitTimer();
+  if (ws) { ws.close(); ws = null; }
+  document.getElementById('waiting-section').classList.add('hidden');
+  document.getElementById('link-section').classList.add('hidden');
+  dropZone.style.pointerEvents = '';
+  dropZone.style.opacity = '';
+  fileInfo.classList.add('hidden');
+  selectedFile = null;
+}
+
+function showError(msg) {
+  stopWaitTimer();
+  const el = document.getElementById('error-msg');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+window.addEventListener('beforeunload', e => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+</script>
+
+</body>
+</html>

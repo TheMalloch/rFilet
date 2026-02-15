@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>filet - download</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  background: #0a0a0a; color: #e0e0e0;
+  min-height: 100vh; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; padding: 2rem;
+}
+h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #fff; }
+.subtitle { color: #666; margin-bottom: 2rem; font-size: 0.85rem; }
+.card {
+  background: #111; border: 1px solid #333; border-radius: 12px;
+  padding: 2rem; max-width: 500px; width: 100%; text-align: center;
+}
+.filename { font-size: 1.1rem; color: #4a9eff; word-break: break-all; }
+.filesize { color: #888; font-size: 0.9rem; margin-top: 0.25rem; }
+.btn {
+  background: #4a9eff; color: #000; border: none; border-radius: 6px;
+  padding: 0.75rem 2rem; font-family: inherit; cursor: pointer;
+  font-weight: 600; font-size: 1rem; margin-top: 1.5rem;
+  display: inline-block;
+}
+.btn:hover { background: #6ab4ff; }
+.btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+.progress-container {
+  margin-top: 1.5rem; text-align: left;
+}
+.progress-bar-outer {
+  width: 100%; height: 8px; background: #222; border-radius: 4px;
+  overflow: hidden; margin: 0.5rem 0;
+}
+.progress-bar-inner {
+  height: 100%; background: #4a9eff; width: 0%;
+  transition: width 0.2s; border-radius: 4px;
+}
+.progress-stats { display: flex; justify-content: space-between; font-size: 0.8rem; color: #888; }
+.status-msg { color: #888; font-size: 0.85rem; margin-top: 1rem; }
+.status-msg.error { color: #ff4a4a; }
+.status-msg.success { color: #4aff4a; }
+.hidden { display: none; }
+.encrypt-badge {
+  display: inline-block; background: #1a2a1a; color: #4aff4a;
+  font-size: 0.7rem; padding: 0.2rem 0.5rem; border-radius: 4px;
+  margin-top: 0.5rem;
+}
+</style>
+</head>
+<body>
+
+<h1>filet</h1>
+<p class="subtitle">encrypted file transfer</p>
+
+<div class="card">
+  <div id="loading-msg" class="status-msg">connecting...</div>
+
+  <div id="file-section" class="hidden">
+    <div class="filename" id="filename"></div>
+    <div class="filesize" id="filesize"></div>
+    <div class="encrypt-badge">end-to-end encrypted</div>
+    <button class="btn" id="download-btn" onclick="startDownload()">download</button>
+  </div>
+
+  <div id="progress-section" class="hidden">
+    <div class="progress-container">
+      <div>downloading...</div>
+      <div class="progress-bar-outer"><div class="progress-bar-inner" id="progress-bar"></div></div>
+      <div class="progress-stats">
+        <span id="progress-pct">0%</span>
+        <span id="progress-speed"></span>
+        <span id="progress-bytes">0 / 0</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="done-msg" class="status-msg success hidden"></div>
+  <div id="error-msg" class="status-msg error hidden"></div>
+  <div id="not-found" class="status-msg error hidden">transfer not found or expired</div>
+</div>
+
+<script>
+const TRANSFER_ID = '{{TRANSFER_ID}}';
+let ws = null;
+let metadata = null;
+let blob = new Blob([]);
+let recentChunks = [];
+let recentChunksSize = 0;
+const BLOB_MERGE_THRESHOLD = 4 * 1024 * 1024; // merge every 4MB
+let receivedBytes = 0;
+let startTime = null;
+let encKey = null;
+const DECRYPT_CONCURRENCY = 6;
+let decryptQueue = [];
+let decryptInFlight = 0;
+let nextDecryptIndex = 0;
+let nextAssembleIndex = 0;
+let decryptedResults = new Map();
+let decryptDoneResolve = null;
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
+  return (bytes/1024/1024/1024).toFixed(2) + ' GB';
+}
+
+async function importKey() {
+  const fragment = window.location.hash.slice(1);
+  if (!fragment) return null;
+  // Decode URL-safe base64
+  let b64 = fragment.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+}
+
+async function init() {
+  encKey = await importKey();
+  if (!encKey) {
+    showError('Missing encryption key (check your link)');
+    return;
+  }
+
+  // Check if transfer exists
+  try {
+    const resp = await fetch(`/api/transfer/${TRANSFER_ID}`);
+    if (!resp.ok) {
+      document.getElementById('loading-msg').classList.add('hidden');
+      document.getElementById('not-found').classList.remove('hidden');
+      return;
+    }
+    const data = await resp.json();
+    metadata = data;
+    document.getElementById('filename').textContent = data.filename;
+    document.getElementById('filesize').textContent = formatSize(data.size);
+    document.getElementById('loading-msg').classList.add('hidden');
+    document.getElementById('file-section').classList.remove('hidden');
+  } catch (e) {
+    showError('Failed to connect');
+  }
+}
+
+function startDownload() {
+  document.getElementById('download-btn').disabled = true;
+  document.getElementById('file-section').classList.add('hidden');
+  document.getElementById('progress-section').classList.remove('hidden');
+  startTime = Date.now();
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/recv/${TRANSFER_ID}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'metadata') {
+        metadata = msg;
+      } else if (msg.type === 'done') {
+        // Wait for all pending decryptions, then assemble
+        if (decryptInFlight === 0 && decryptQueue.length === 0) {
+          assembleAndDownload();
+        } else {
+          new Promise(r => { decryptDoneResolve = r; }).then(() => assembleAndDownload());
+        }
+      } else if (msg.type === 'error') {
+        showError(msg.error);
+      }
+    } else {
+      // Queue encrypted chunk with its order index
+      const index = nextDecryptIndex++;
+      decryptQueue.push({ data: e.data, index });
+      pumpDecryptQueue();
+    }
+  };
+
+  ws.onclose = () => {
+    if (!document.getElementById('done-msg').textContent && !document.getElementById('error-msg').textContent) {
+      showError('Connection lost');
+    }
+  };
+  ws.onerror = () => showError('WebSocket error');
+}
+
+function pumpDecryptQueue() {
+  while (decryptInFlight < DECRYPT_CONCURRENCY && decryptQueue.length > 0) {
+    const { data, index } = decryptQueue.shift();
+    decryptInFlight++;
+    decryptChunk(data, index);
+  }
+}
+
+async function decryptChunk(data, index) {
+  const payload = new Uint8Array(data);
+  const iv = payload.slice(0, 12);
+  const ciphertext = payload.slice(12);
+  try {
+    const plaintext = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv }, encKey, ciphertext
+    );
+    decryptedResults.set(index, new Uint8Array(plaintext));
+    // Assemble in order
+    while (decryptedResults.has(nextAssembleIndex)) {
+      const chunk = decryptedResults.get(nextAssembleIndex);
+      decryptedResults.delete(nextAssembleIndex);
+      nextAssembleIndex++;
+      recentChunks.push(chunk);
+      recentChunksSize += chunk.byteLength;
+      receivedBytes += chunk.byteLength;
+      if (recentChunksSize >= BLOB_MERGE_THRESHOLD) {
+        blob = new Blob([blob, ...recentChunks]);
+        recentChunks = [];
+        recentChunksSize = 0;
+      }
+    }
+    updateProgress();
+  } catch (err) {
+    showError('Decryption failed - invalid key');
+    ws.close();
+    return;
+  }
+  decryptInFlight--;
+  pumpDecryptQueue();
+  // Signal completion if all done
+  if (decryptInFlight === 0 && decryptQueue.length === 0 && decryptDoneResolve) {
+    const r = decryptDoneResolve;
+    decryptDoneResolve = null;
+    r();
+  }
+}
+
+function updateProgress() {
+  if (!metadata) return;
+  const total = metadata.size;
+  const pct = Math.min(100, (receivedBytes / total) * 100);
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('progress-pct').textContent = pct.toFixed(1) + '%';
+  document.getElementById('progress-bytes').textContent = `${formatSize(receivedBytes)} / ${formatSize(total)}`;
+  const elapsed = (Date.now() - startTime) / 1000;
+  if (elapsed > 0.5) {
+    document.getElementById('progress-speed').textContent = formatSize(receivedBytes / elapsed) + '/s';
+  }
+}
+
+function assembleAndDownload() {
+  // Merge any remaining chunks into the final blob
+  if (recentChunks.length > 0) {
+    blob = new Blob([blob, ...recentChunks], { type: metadata.mime_type || 'application/octet-stream' });
+    recentChunks = [];
+    recentChunksSize = 0;
+  } else {
+    blob = new Blob([blob], { type: metadata.mime_type || 'application/octet-stream' });
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = metadata.filename;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  document.getElementById('progress-section').classList.add('hidden');
+  const doneMsg = document.getElementById('done-msg');
+  doneMsg.textContent = `downloaded ${metadata.filename} (${formatSize(receivedBytes)})`;
+  doneMsg.classList.remove('hidden');
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-msg');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+init();
+</script>
+
+</body>
+</html>
