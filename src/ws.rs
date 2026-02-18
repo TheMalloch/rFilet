@@ -1,9 +1,12 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::state::*;
+
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(serde::Deserialize)]
 struct SenderInit {
@@ -20,6 +23,8 @@ struct SenderResponse {
     id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<u64>,
 }
 
 pub async fn handle_sender(socket: WebSocket, state: AppState) {
@@ -48,6 +53,7 @@ pub async fn handle_sender(socket: WebSocket, state: AppState) {
                                     r#type: "error".into(),
                                     id: None,
                                     error: Some(format!("Invalid metadata: {e}")),
+                                    offset: None,
                                 })
                                 .unwrap()
                                 .into(),
@@ -81,6 +87,7 @@ pub async fn handle_sender(socket: WebSocket, state: AppState) {
                 r#type: "ready".into(),
                 id: Some(id.clone()),
                 error: None,
+                offset: None,
             })
             .unwrap()
             .into(),
@@ -89,30 +96,39 @@ pub async fn handle_sender(socket: WebSocket, state: AppState) {
 
     info!(transfer_id = %id, filename = %metadata.filename, size = metadata.size, "Transfer created, waiting for recipient");
 
-    // Step 3: Wait for recipient to connect (or sender to disconnect)
-    let recipient_link = tokio::select! {
-        result = recipient_rx => {
-            match result {
-                Ok(link) => link,
-                Err(_) => {
-                    warn!(transfer_id = %id, "Recipient channel dropped");
-                    state.transfers.remove(&id);
-                    return;
+    // Step 3: Wait for recipient to connect (or sender to disconnect).
+    // Loop so we can ignore keepalive messages and send periodic pings to
+    // keep the connection alive when the sender tab is backgrounded on mobile.
+    let mut recipient_link = {
+        tokio::pin!(recipient_rx);
+        let mut ping_timer = tokio::time::interval(Duration::from_secs(15));
+        ping_timer.tick().await; // skip the initial immediate tick
+        loop {
+            tokio::select! {
+                result = &mut recipient_rx => {
+                    match result {
+                        Ok(link) => break link,
+                        Err(_) => {
+                            warn!(transfer_id = %id, "Recipient channel dropped");
+                            state.transfers.remove(&id);
+                            return;
+                        }
+                    }
+                }
+                msg = ws_rx.next() => {
+                    match msg {
+                        Some(Ok(Message::Close(_))) | None => {
+                            info!(transfer_id = %id, "Sender disconnected while waiting");
+                            state.transfers.remove(&id);
+                            return;
+                        }
+                        _ => {} // keepalive pong or other — ignore
+                    }
+                }
+                _ = ping_timer.tick() => {
+                    let _ = ws_tx.send(Message::Ping(bytes::Bytes::new())).await;
                 }
             }
-        }
-        msg = ws_rx.next() => {
-            // Sender disconnected or sent something while waiting
-            match msg {
-                Some(Ok(Message::Close(_))) | None => {
-                    info!(transfer_id = %id, "Sender disconnected while waiting");
-                }
-                _ => {
-                    warn!(transfer_id = %id, "Unexpected message from sender while waiting");
-                }
-            }
-            state.transfers.remove(&id);
-            return;
         }
     };
 
@@ -123,6 +139,7 @@ pub async fn handle_sender(socket: WebSocket, state: AppState) {
                 r#type: "start".into(),
                 id: None,
                 error: None,
+                offset: None,
             })
             .unwrap()
             .into(),
@@ -131,18 +148,145 @@ pub async fn handle_sender(socket: WebSocket, state: AppState) {
 
     info!(transfer_id = %id, "Transfer started");
 
-    let data_tx = recipient_link.data_tx;
-    let mut cancel_rx = recipient_link.cancel_rx;
+    // Step 5: Relay loop with reconnection support
+    loop {
+        let data_tx = recipient_link.data_tx;
+        let mut cancel_rx = recipient_link.cancel_rx;
 
-    // Step 5: Relay data from sender WS to mpsc channel
+        let relay_result = relay_data(&mut ws_rx, &mut ws_tx, &data_tx, &mut cancel_rx, &id).await;
+
+        match relay_result {
+            RelayResult::Done | RelayResult::SenderDisconnected => break,
+            RelayResult::RecipientDisconnected => {
+                // Recipient dropped — try to let them reconnect
+                let (new_tx, new_rx) = oneshot::channel::<RecipientLink>();
+                state.transfers.insert(
+                    id.clone(),
+                    TransferState::Reconnecting {
+                        metadata: metadata.clone(),
+                        recipient_tx: new_tx,
+                    },
+                );
+
+                let _ = ws_tx
+                    .send(Message::Text(
+                        serde_json::to_string(&SenderResponse {
+                            r#type: "paused".into(),
+                            id: None,
+                            error: None,
+                            offset: None,
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await;
+
+                info!(transfer_id = %id, "Recipient disconnected, waiting for reconnect");
+
+                // Wait for reconnect, timeout, or sender disconnect.
+                // Loop to ignore keepalive messages and send pings to the sender.
+                let new_link = {
+                    tokio::pin!(new_rx);
+                    let sleep = tokio::time::sleep(RECONNECT_TIMEOUT);
+                    tokio::pin!(sleep);
+                    let mut ping_timer = tokio::time::interval(Duration::from_secs(15));
+                    ping_timer.tick().await;
+                    loop {
+                        tokio::select! {
+                            result = &mut new_rx => {
+                                match result {
+                                    Ok(link) => break Some(link),
+                                    Err(_) => break None,
+                                }
+                            }
+                            _ = &mut sleep => {
+                                info!(transfer_id = %id, "Reconnect timeout");
+                                state.transfers.remove(&id);
+                                break None;
+                            }
+                            msg = ws_rx.next() => {
+                                match msg {
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        info!(transfer_id = %id, "Sender disconnected while waiting for reconnect");
+                                        state.transfers.remove(&id);
+                                        break None;
+                                    }
+                                    _ => {} // keepalive pong — ignore
+                                }
+                            }
+                            _ = ping_timer.tick() => {
+                                let _ = ws_tx.send(Message::Ping(bytes::Bytes::new())).await;
+                            }
+                        }
+                    }
+                };
+
+                match new_link {
+                    Some(link) => {
+                        // Tell sender to resume from the receiver's offset
+                        let _ = ws_tx
+                            .send(Message::Text(
+                                serde_json::to_string(&SenderResponse {
+                                    r#type: "resume".into(),
+                                    id: None,
+                                    error: None,
+                                    offset: Some(link.resume_offset),
+                                })
+                                .unwrap()
+                                .into(),
+                            ))
+                            .await;
+
+                        info!(transfer_id = %id, offset = link.resume_offset, "Recipient reconnected, resuming");
+                        state.transfers.insert(id.clone(), TransferState::Active);
+                        recipient_link = link;
+                        // Continue outer loop — restart relay
+                    }
+                    None => {
+                        // Give up
+                        let _ = ws_tx
+                            .send(Message::Text(
+                                serde_json::to_string(&SenderResponse {
+                                    r#type: "cancelled".into(),
+                                    id: None,
+                                    error: Some("Recipient disconnected".into()),
+                                    offset: None,
+                                })
+                                .unwrap()
+                                .into(),
+                            ))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    state.transfers.remove(&id);
+}
+
+enum RelayResult {
+    Done,
+    SenderDisconnected,
+    RecipientDisconnected,
+}
+
+async fn relay_data(
+    ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
+    _ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    data_tx: &mpsc::Sender<RelayMessage>,
+    cancel_rx: &mut mpsc::Receiver<()>,
+    id: &str,
+) -> RelayResult {
     loop {
         tokio::select! {
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
                         if data_tx.send(RelayMessage::Data(data)).await.is_err() {
-                            warn!(transfer_id = %id, "Recipient disconnected during transfer");
-                            break;
+                            warn!(transfer_id = %id, "Recipient channel closed during relay");
+                            return RelayResult::RecipientDisconnected;
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -150,44 +294,46 @@ pub async fn handle_sender(socket: WebSocket, state: AppState) {
                             if val.get("type").and_then(|t| t.as_str()) == Some("done") {
                                 let _ = data_tx.send(RelayMessage::Finished).await;
                                 info!(transfer_id = %id, "Transfer complete");
-                                break;
+                                return RelayResult::Done;
                             }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         let _ = data_tx.send(RelayMessage::Error("Sender disconnected".into())).await;
                         warn!(transfer_id = %id, "Sender disconnected during transfer");
-                        break;
+                        return RelayResult::SenderDisconnected;
                     }
                     _ => continue,
                 }
             }
             _ = cancel_rx.recv() => {
-                info!(transfer_id = %id, "Recipient cancelled transfer");
-                let _ = ws_tx.send(Message::Text(
-                    serde_json::to_string(&SenderResponse {
-                        r#type: "cancelled".into(),
-                        id: None,
-                        error: Some("Recipient disconnected".into()),
-                    }).unwrap().into()
-                )).await;
-                break;
+                info!(transfer_id = %id, "Recipient disconnected during transfer");
+                return RelayResult::RecipientDisconnected;
             }
         }
     }
-
-    state.transfers.insert(id, TransferState::Done);
 }
 
-pub async fn handle_receiver(socket: WebSocket, id: String, state: AppState) {
+pub async fn handle_receiver(socket: WebSocket, id: String, state: AppState, resume_offset: u64) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Atomically remove the transfer from the map
     let entry = state.transfers.remove(&id);
     let (metadata, recipient_tx) = match entry {
-        Some((_, TransferState::WaitingForRecipient { metadata, recipient_tx, .. })) => {
-            (metadata, recipient_tx)
-        }
+        Some((
+            _,
+            TransferState::WaitingForRecipient {
+                metadata,
+                recipient_tx,
+            },
+        )) => (metadata, recipient_tx),
+        Some((
+            _,
+            TransferState::Reconnecting {
+                metadata,
+                recipient_tx,
+            },
+        )) => (metadata, recipient_tx),
         _ => {
             let _ = ws_tx
                 .send(Message::Text(
@@ -222,6 +368,7 @@ pub async fn handle_receiver(socket: WebSocket, id: String, state: AppState) {
     let link = RecipientLink {
         data_tx,
         cancel_rx,
+        resume_offset,
     };
 
     if recipient_tx.send(link).is_err() {
@@ -238,7 +385,7 @@ pub async fn handle_receiver(socket: WebSocket, id: String, state: AppState) {
     // Mark as active
     state.transfers.insert(id.clone(), TransferState::Active);
 
-    info!(transfer_id = %id, "Recipient connected, relaying data");
+    info!(transfer_id = %id, resume_offset, "Recipient connected, relaying data");
 
     // Relay data from mpsc channel to recipient WS
     loop {
@@ -289,5 +436,6 @@ pub async fn handle_receiver(socket: WebSocket, id: String, state: AppState) {
         }
     }
 
-    state.transfers.insert(id, TransferState::Done);
+    // Don't mark as Done here — the sender handler decides
+    // (it may transition to Reconnecting instead)
 }

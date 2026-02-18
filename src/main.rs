@@ -4,14 +4,11 @@ mod static_assets;
 mod ws;
 
 use axum::Router;
-use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::state::{AppState, TransferState};
-
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
@@ -23,19 +20,6 @@ async fn main() {
         .init();
 
     let state = AppState::new();
-
-    // Spawn cleanup task - only removes completed transfers.
-    // WaitingForRecipient entries are kept alive as long as the sender WS is connected;
-    // when the sender disconnects, the WS handler removes the entry directly.
-    let cleanup_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(CLEANUP_INTERVAL).await;
-            cleanup_state.transfers.retain(|_id, entry| {
-                !matches!(entry, TransferState::Done)
-            });
-        }
-    });
 
     let app = Router::new()
         .route("/", axum::routing::get(routes::sender_page))

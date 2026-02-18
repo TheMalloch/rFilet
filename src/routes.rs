@@ -1,8 +1,9 @@
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Json},
 };
+use std::collections::HashMap;
 
 use crate::state::{AppState, TransferState};
 use crate::static_assets::{RECEIVER_HTML, SENDER_HTML};
@@ -13,8 +14,15 @@ pub async fn sender_page() -> Html<&'static str> {
 }
 
 pub async fn receiver_page(Path(id): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
-    // Check transfer exists
-    if !state.transfers.contains_key(&id) {
+    // Check transfer exists (accept both WaitingForRecipient and Reconnecting)
+    let exists = state.transfers.get(&id).map_or(false, |entry| {
+        matches!(
+            entry.value(),
+            TransferState::WaitingForRecipient { .. } | TransferState::Reconnecting { .. }
+        )
+    });
+
+    if !exists {
         return (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/html")],
@@ -32,7 +40,8 @@ pub async fn transfer_info(
 ) -> impl IntoResponse {
     match state.transfers.get(&id) {
         Some(entry) => match entry.value() {
-            TransferState::WaitingForRecipient { metadata, .. } => {
+            TransferState::WaitingForRecipient { metadata, .. }
+            | TransferState::Reconnecting { metadata, .. } => {
                 (StatusCode::OK, Json(serde_json::json!({
                     "filename": metadata.filename,
                     "size": metadata.size,
@@ -55,7 +64,12 @@ pub async fn ws_send(
 pub async fn ws_recv(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws::handle_receiver(socket, id, state))
+    let offset: u64 = params
+        .get("offset")
+        .and_then(|o| o.parse().ok())
+        .unwrap_or(0);
+    ws.on_upgrade(move |socket| ws::handle_receiver(socket, id, state, offset))
 }

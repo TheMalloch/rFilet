@@ -101,6 +101,30 @@ let nextDecryptIndex = 0;
 let nextAssembleIndex = 0;
 let decryptedResults = new Map();
 let decryptDoneResolve = null;
+let transferDone = false;
+let transferError = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+
+let wakeLock = null;
+async function requestWakeLock() {
+  if ('wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+}
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && !transferDone && !transferError) {
+    await requestWakeLock();
+    // Reconnect if the WS died while the page was in background
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      reconnectAttempts = 0;
+      connectWs(receivedBytes);
+    }
+  }
+});
 
 function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -149,10 +173,14 @@ function startDownload() {
   document.getElementById('download-btn').disabled = true;
   document.getElementById('file-section').classList.add('hidden');
   document.getElementById('progress-section').classList.remove('hidden');
-  startTime = Date.now();
+  if (!startTime) startTime = Date.now();
+  requestWakeLock();
+  connectWs(0);
+}
 
+function connectWs(offset) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws/recv/${TRANSFER_ID}`);
+  ws = new WebSocket(`${proto}//${location.host}/ws/recv/${TRANSFER_ID}?offset=${offset}`);
   ws.binaryType = 'arraybuffer';
 
   ws.onmessage = (e) => {
@@ -160,18 +188,19 @@ function startDownload() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'metadata') {
         metadata = msg;
+        reconnectAttempts = 0; // successful connection
       } else if (msg.type === 'done') {
-        // Wait for all pending decryptions, then assemble
+        transferDone = true;
         if (decryptInFlight === 0 && decryptQueue.length === 0) {
           assembleAndDownload();
         } else {
           new Promise(r => { decryptDoneResolve = r; }).then(() => assembleAndDownload());
         }
       } else if (msg.type === 'error') {
+        transferError = true;
         showError(msg.error);
       }
     } else {
-      // Queue encrypted chunk with its order index
       const index = nextDecryptIndex++;
       decryptQueue.push({ data: e.data, index });
       pumpDecryptQueue();
@@ -179,11 +208,25 @@ function startDownload() {
   };
 
   ws.onclose = () => {
-    if (!document.getElementById('done-msg').textContent && !document.getElementById('error-msg').textContent) {
+    if (transferDone || transferError) return;
+    // Connection lost mid-transfer — try to reconnect
+    if (receivedBytes > 0 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++;
+      document.querySelector('.progress-container > div:first-child').textContent =
+        `reconnecting... (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`;
+      // Clear in-flight decrypt state for fresh stream
+      decryptQueue = [];
+      decryptInFlight = 0;
+      nextDecryptIndex = 0;
+      nextAssembleIndex = 0;
+      decryptedResults = new Map();
+      decryptDoneResolve = null;
+      setTimeout(() => connectWs(receivedBytes), 1500);
+    } else {
       showError('Connection lost');
     }
   };
-  ws.onerror = () => showError('WebSocket error');
+  ws.onerror = () => {}; // onclose will handle it
 }
 
 function pumpDecryptQueue() {
@@ -266,9 +309,11 @@ function assembleAndDownload() {
   const doneMsg = document.getElementById('done-msg');
   doneMsg.textContent = `downloaded ${metadata.filename} (${formatSize(receivedBytes)})`;
   doneMsg.classList.remove('hidden');
+  releaseWakeLock();
 }
 
 function showError(msg) {
+  releaseWakeLock();
   const el = document.getElementById('error-msg');
   el.textContent = msg;
   el.classList.remove('hidden');

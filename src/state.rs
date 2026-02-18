@@ -31,13 +31,17 @@ pub enum TransferState {
         metadata: FileMetadata,
         recipient_tx: oneshot::Sender<RecipientLink>,
     },
+    Reconnecting {
+        metadata: FileMetadata,
+        recipient_tx: oneshot::Sender<RecipientLink>,
+    },
     Active,
-    Done,
 }
 
 pub struct RecipientLink {
     pub data_tx: mpsc::Sender<RelayMessage>,
     pub cancel_rx: mpsc::Receiver<()>,
+    pub resume_offset: u64,
 }
 
 pub enum RelayMessage {

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>filet - send file</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" crossorigin="anonymous"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -80,7 +81,11 @@ h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #fff; }
   <div id="link-section" class="hidden">
     <div class="link-box">
       <input type="text" id="share-link" readonly>
-      <button onclick="copyLink()">copy</button>
+      <button onclick="copyLink()" id="copy-btn">copy</button>
+    </div>
+    <div id="qr-container" style="text-align:center; margin-top:1rem; display:none;">
+      <div id="qr-code" style="display:inline-block; padding:8px; background:#fff; border-radius:8px;"></div>
+      <div style="font-size:0.7rem; color:#555; margin-top:0.4rem;">scan to receive on mobile</div>
     </div>
   </div>
 
@@ -107,6 +112,22 @@ const PIPELINE_DEPTH = 8;
 let ws = null;
 let selectedFile = null;
 let encKey = null;
+let sendAborted = false;
+
+let wakeLock = null;
+async function requestWakeLock() {
+  if ('wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+}
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && ws && ws.readyState === WebSocket.OPEN) {
+    await requestWakeLock();
+  }
+});
 
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
@@ -144,6 +165,7 @@ async function handleFile(file) {
 }
 
 async function startSender() {
+  requestWakeLock();
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws/send`);
 
@@ -167,11 +189,25 @@ async function startSender() {
       document.getElementById('link-section').classList.remove('hidden');
       document.getElementById('waiting-section').classList.remove('hidden');
       startWaitTimer();
+      if (typeof QRCode !== 'undefined') {
+        new QRCode(document.getElementById('qr-code'), {
+          text: link, width: 160, height: 160,
+          colorDark: '#000000', colorLight: '#ffffff',
+        });
+        document.getElementById('qr-container').style.display = '';
+      }
     } else if (msg.type === 'start') {
       stopWaitTimer();
       document.getElementById('waiting-section').classList.add('hidden');
       document.getElementById('progress-section').classList.remove('hidden');
       sendFile();
+    } else if (msg.type === 'paused') {
+      sendAborted = true;
+      document.querySelector('.progress-container > div:first-child').textContent = 'recipient reconnecting...';
+    } else if (msg.type === 'resume') {
+      sendAborted = false;
+      document.querySelector('.progress-container > div:first-child').textContent = 'sending...';
+      sendFile(msg.offset || 0);
     } else if (msg.type === 'cancelled') {
       showError('Recipient disconnected');
     } else if (msg.type === 'error') {
@@ -197,10 +233,10 @@ function yieldMicro() {
   });
 }
 
-async function sendFile() {
+async function sendFile(startOffset) {
   const file = selectedFile;
-  const startTime = Date.now();
-  let sentBytes = 0;
+  const sendStartTime = Date.now();
+  let sentBytes = startOffset || 0;
 
   // Producer: encrypt chunks ahead into a queue
   const encryptedQueue = [];
@@ -209,19 +245,22 @@ async function sendFile() {
   let consumerResolve = null;
 
   async function producer() {
-    let offset = 0;
-    while (offset < file.size) {
+    let offset = startOffset || 0;
+    while (offset < file.size && !sendAborted) {
       // Backpressure: limit queue depth
-      while (encryptedQueue.length >= PIPELINE_DEPTH) {
+      while (encryptedQueue.length >= PIPELINE_DEPTH && !sendAborted) {
         await new Promise(r => { queueResolve = r; });
       }
+      if (sendAborted) break;
       const end = Math.min(offset + CHUNK_SIZE, file.size);
       const blob = file.slice(offset, end);
       const chunk = new Uint8Array(await blob.arrayBuffer());
+      if (sendAborted) break;
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const encrypted = await crypto.subtle.encrypt(
         { name: 'AES-GCM', iv }, encKey, chunk
       );
+      if (sendAborted) break;
       const payload = new Uint8Array(12 + encrypted.byteLength);
       payload.set(iv);
       payload.set(new Uint8Array(encrypted), 12);
@@ -237,7 +276,7 @@ async function sendFile() {
 
   // Consumer: drain queue into WebSocket
   async function consumer() {
-    while (!encryptDone || encryptedQueue.length > 0) {
+    while ((!encryptDone || encryptedQueue.length > 0) && !sendAborted) {
       if (encryptedQueue.length === 0) {
         // Wait for producer to signal new data (not throttled by browser)
         await new Promise(r => { consumerResolve = r; });
@@ -246,23 +285,35 @@ async function sendFile() {
       const { payload, plainSize } = encryptedQueue.shift();
       // Wake producer if it was waiting on queue depth
       if (queueResolve) { const r = queueResolve; queueResolve = null; r(); }
+      if (sendAborted) break;
       // Backpressure: wait if WS buffer is full
-      while (ws.bufferedAmount > MAX_BUFFERED) {
+      while (ws.bufferedAmount > MAX_BUFFERED && !sendAborted) {
         await yieldMicro();
       }
+      if (sendAborted) break;
       ws.send(payload);
       sentBytes += plainSize;
-      updateProgress(sentBytes, file.size, startTime);
+      updateProgress(sentBytes, file.size, sendStartTime);
     }
   }
 
   await Promise.all([producer(), consumer()]);
 
+  if (sendAborted) {
+    // Aborted due to pause — wake any stuck promises
+    if (queueResolve) { const r = queueResolve; queueResolve = null; r(); }
+    if (consumerResolve) { const r = consumerResolve; consumerResolve = null; r(); }
+    return;
+  }
+
   ws.send(JSON.stringify({ type: 'done' }));
+  ws = null;
+  releaseWakeLock();
   document.getElementById('progress-section').classList.add('hidden');
   const doneMsg = document.getElementById('done-msg');
   doneMsg.textContent = `sent ${file.name} (${formatSize(file.size)})`;
   doneMsg.classList.remove('hidden');
+  setTimeout(() => location.reload(), 3000);
 }
 
 function updateProgress(offset, total, startTime) {
@@ -279,6 +330,9 @@ function updateProgress(offset, total, startTime) {
 function copyLink() {
   const input = document.getElementById('share-link');
   navigator.clipboard.writeText(input.value);
+  const btn = document.getElementById('copy-btn');
+  btn.textContent = 'copied!';
+  setTimeout(() => { btn.textContent = 'copy'; }, 1500);
 }
 
 let waitInterval = null;
@@ -311,6 +365,7 @@ function cancelWait() {
 
 function showError(msg) {
   stopWaitTimer();
+  releaseWakeLock();
   const el = document.getElementById('error-msg');
   el.textContent = msg;
   el.classList.remove('hidden');
