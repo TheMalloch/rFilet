@@ -41,9 +41,13 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "4010".to_string());
+    let port = std::env::var("API_PORT")
+        .or_else(|_| std::env::var("PORT"))
+        .unwrap_or_else(|_| "4020".to_string());
+    let public_url = std::env::var("PUBLIC_URL")
+        .unwrap_or_else(|_| "https://apifilet.rasporar.org".to_string());
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await.unwrap();
-    info!("filet listening on http://localhost:{port}");
+    info!("filet api listening on http://localhost:{port} (public: {public_url})");
     axum::serve(listener, app).await.unwrap();
 }
