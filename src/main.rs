@@ -12,6 +12,21 @@ use axum::http::{Method, header};
 
 use crate::state::AppState;
 
+fn arg_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == flag {
+            return args.next();
+        }
+        if let Some((key, value)) = arg.split_once('=')
+            && key == flag
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -41,13 +56,12 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let port = std::env::var("API_PORT")
-        .or_else(|_| std::env::var("PORT"))
-        .unwrap_or_else(|_| "4020".to_string());
-    let public_url = std::env::var("PUBLIC_URL")
-        .unwrap_or_else(|_| "https://apifilet.rasporar.org".to_string());
+    let port = arg_value("--port")
+        .or_else(|| std::env::var("API_PORT").ok())
+        .or_else(|| std::env::var("PORT").ok())
+        .unwrap_or_else(|| "4020".to_string());
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await.unwrap();
-    info!("filet api listening on http://localhost:{port} (public: {public_url})");
+    info!("filet api listening on port {port}");
     axum::serve(listener, app).await.unwrap();
 }
