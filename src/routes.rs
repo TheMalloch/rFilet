@@ -1,75 +1,48 @@
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
-    http::{header, StatusCode},
-    response::{Html, IntoResponse, Json},
+    extract::{Path, State, WebSocketUpgrade},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Json},
 };
-use std::collections::HashMap;
+use serde_json::json;
 
-use crate::state::{AppState, TransferState};
-use crate::static_assets::{RECEIVER_HTML, SENDER_HTML};
+use crate::state::AppState;
 use crate::ws;
 
-pub async fn sender_page() -> Html<&'static str> {
-    Html(SENDER_HTML)
+pub async fn health() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "ok": true, "service": "filet" })))
 }
 
-pub async fn receiver_page(Path(id): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
-    // Check transfer exists (accept both WaitingForRecipient and Reconnecting)
-    let exists = state.transfers.get(&id).map_or(false, |entry| {
-        matches!(
-            entry.value(),
-            TransferState::WaitingForRecipient { .. } | TransferState::Reconnecting { .. }
-        )
-    });
+pub async fn download_blob(Path(id): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
+    let Some(entry) = state.blobs.get(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
-    if !exists {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/html")],
-            "<!DOCTYPE html><html><body style='background:#0a0a0a;color:#e0e0e0;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh'><p>transfer not found or expired</p></body></html>".to_string(),
-        );
+    let filename = entry.filename.clone();
+    let size = entry.size;
+    let bytes = entry.bytes.clone();
+    drop(entry);
+
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
     }
-
-    let html = RECEIVER_HTML.replace("{{TRANSFER_ID}}", &id);
-    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html)
-}
-
-pub async fn transfer_info(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    match state.transfers.get(&id) {
-        Some(entry) => match entry.value() {
-            TransferState::WaitingForRecipient { metadata, .. }
-            | TransferState::Reconnecting { metadata, .. } => {
-                (StatusCode::OK, Json(serde_json::json!({
-                    "filename": metadata.filename,
-                    "size": metadata.size,
-                    "mime_type": metadata.mime_type,
-                }))).into_response()
-            }
-            _ => StatusCode::GONE.into_response(),
-        },
-        None => StatusCode::NOT_FOUND.into_response(),
+    if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
+    response
 }
 
 pub async fn ws_send(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let ws = ws
+        .max_message_size(1024 * 1024 * 1024)
+        .max_frame_size(16 * 1024 * 1024);
     ws.on_upgrade(move |socket| ws::handle_sender(socket, state))
-}
-
-pub async fn ws_recv(
-    ws: WebSocketUpgrade,
-    Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let offset: u64 = params
-        .get("offset")
-        .and_then(|o| o.parse().ok())
-        .unwrap_or(0);
-    ws.on_upgrade(move |socket| ws::handle_receiver(socket, id, state, offset))
 }
