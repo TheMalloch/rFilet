@@ -37,6 +37,25 @@ async fn main() {
         .init();
 
     let state = AppState::new();
+    let cleanup_state = state.clone();
+
+    let cleanup_interval_seconds = std::env::var("CLEANUP_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let deleted = cleanup_state.purge_expired();
+            if deleted > 0 {
+                info!("purged {deleted} expired files");
+            }
+        }
+    });
 
     let cors = CorsLayer::new()
         .allow_origin(
@@ -62,6 +81,6 @@ async fn main() {
         .unwrap_or_else(|| "4020".to_string());
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await.unwrap();
-    info!("filet api listening on port {port}");
+    info!("filet api listening on port {port}, cleanup interval {cleanup_interval_seconds}s");
     axum::serve(listener, app).await.unwrap();
 }
